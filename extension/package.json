@@ -1,0 +1,45 @@
+{
+  "name": "vs-code-updater",
+  "displayName": "VS Code Updater (safe reload for Claude Code)",
+  "description": "Reloads a window after Claude Code updates, only when no Claude Code work is running in it and you are away from it. Unofficial; not affiliated with Anthropic.",
+  "version": "0.2.0",
+  "publisher": "kisookim",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/KisooLabs/vs-code-updater"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "extensionKind": [
+    "ui"
+  ],
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "vscodeUpdater.reloadNow",
+        "title": "VS Code Updater: Reload this window now (checks Claude Code first)"
+      },
+      {
+        "command": "vscodeUpdater.showState",
+        "title": "VS Code Updater: Show this window's state"
+      },
+      {
+        "command": "vscodeUpdater.openLogs",
+        "title": "VS Code Updater: Open log folder"
+      }
+    ]
+  },
+  "scripts": {
+    "test": "node --test test/core.test.js",
+    "package": "npx --yes @vscode/vsce package"
+  }
+}
