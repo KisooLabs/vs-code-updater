@@ -153,3 +153,110 @@ test('decide: tabs that would reopen empty lead to title, working sessions still
   assert.strictEqual(core.decide({ ...base, sessions: [empty, { pid: 2, registry: { status: 'busy' }, kids: [] }] }).action, 'wait');
   assert.strictEqual(core.decide({ ...base, user: { ...idleUser, focused: true }, sessions: [empty] }).action, 'wait');
 });
+
+test('mergeConfig: minReloadGapSeconds and holdAtCommitPercent defaults, clamps, wrong types', () => {
+  const d = core.mergeConfig(null);
+  assert.strictEqual(d.minReloadGapSeconds, 30);
+  assert.strictEqual(d.holdAtCommitPercent, 90);
+  const c = core.mergeConfig({ minReloadGapSeconds: -5, holdAtCommitPercent: 20 });
+  assert.strictEqual(c.minReloadGapSeconds, 0);
+  assert.strictEqual(c.holdAtCommitPercent, 50);
+  const h = core.mergeConfig({ minReloadGapSeconds: 1e9, holdAtCommitPercent: 120 });
+  assert.strictEqual(h.minReloadGapSeconds, 3600);
+  assert.strictEqual(h.holdAtCommitPercent, 100);
+  assert.strictEqual(core.mergeConfig({ minReloadGapSeconds: "45" }).minReloadGapSeconds, 30);
+});
+
+test('commitHold: Windows only, missing value holds, threshold inclusive', () => {
+  assert.deepStrictEqual(core.commitHold(0.99, 'darwin', cfg), { hold: false });
+  assert.strictEqual(core.commitHold(null, 'win32', cfg).hold, true);
+  assert.strictEqual(core.commitHold(NaN, 'win32', cfg).reason, 'commit charge not measured');
+  assert.deepStrictEqual(core.commitHold(0.85, 'win32', cfg), { hold: false, percent: 85 });
+  assert.strictEqual(core.commitHold(0.9, 'win32', cfg).hold, true);
+  const high = core.commitHold(0.9514, 'win32', cfg);
+  assert.strictEqual(high.reason, 'commit charge at or above holdAtCommitPercent');
+  assert.strictEqual(high.percent, 95.1);
+  assert.strictEqual(core.commitHold(0.999, 'win32', core.mergeConfig({ holdAtCommitPercent: 100 })).hold, false);
+});
+
+test('decide: commit charge holds after the session query, with a constant reason', () => {
+  const base = { stale, user: idleUser, debugActive: false, tasksRunning: false, sessions: [idleSession()], failed: false, now: NOW, cfg };
+  const held = core.decide({ ...base, commit: 0.95, platform: 'win32' });
+  assert.deepStrictEqual(held.reasons, ['commit charge at or above holdAtCommitPercent']);
+  assert.strictEqual(held.action, 'wait');
+  assert.strictEqual(held.commitPercent, 95);
+  assert.strictEqual(core.decide({ ...base, commit: 0.5, platform: 'win32' }).action, 'reload');
+  assert.strictEqual(core.decide({ ...base, commit: null, platform: 'win32' }).action, 'wait');
+  assert.strictEqual(core.decide({ ...base, commit: null, platform: 'linux' }).action, 'reload');
+  assert.deepStrictEqual(core.decide({ ...base, sessions: null, commit: 0.95, platform: 'win32' }).reasons, ['sessions not checked']);
+});
+
+test('external reload loop: own reloads excuse their activation, 2-minute window, warning every 10 minutes', () => {
+  const s = 1000;
+  assert.strictEqual(core.externalActivations([NOW - 50 * s, NOW], [], NOW).length, 2);
+  const three = core.externalActivations([NOW - 100 * s, NOW - 50 * s, NOW], [], NOW);
+  assert.strictEqual(three.length, 3);
+  assert.strictEqual(core.loopWarning(three, undefined, NOW), true);
+  assert.strictEqual(core.externalActivations([NOW - 100 * s, NOW - 50 * s, NOW], [NOW - 52 * s], NOW).length, 2);
+  assert.strictEqual(core.externalActivations([NOW - 130 * s, NOW - 50 * s, NOW], [], NOW).length, 2);
+  // two own reloads plus one external
+  assert.strictEqual(core.externalActivations([NOW - 100 * s, NOW - 50 * s, NOW], [NOW - 101 * s, NOW - 51 * s], NOW).length, 1);
+  // an own reload excuses an activation up to 5 minutes later (minimized windows come back slowly), not later
+  assert.strictEqual(core.externalActivations([NOW], [NOW - 132 * s], NOW).length, 0);
+  assert.strictEqual(core.externalActivations([NOW], [NOW - 301 * s], NOW).length, 1);
+  assert.strictEqual(core.loopWarning(three, NOW - 5 * 60 * s, NOW), false);
+  assert.strictEqual(core.loopWarning(three, NOW - 11 * 60 * s, NOW), true);
+  assert.strictEqual(core.loopWarning(three.slice(1), undefined, NOW), false);
+  assert.strictEqual(core.ownReloadJustNow([NOW - 30 * s], NOW), true);
+  assert.strictEqual(core.ownReloadJustNow([NOW - 132 * s], NOW), true);
+  assert.strictEqual(core.ownReloadJustNow([NOW - 301 * s], NOW), false);
+  assert.deepStrictEqual(core.pushRecent([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 11), [2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+  assert.deepStrictEqual(core.pushRecent('junk', 5), [5]);
+});
+
+test('slot: one automatic reload per gap machine-wide, boundary race, manual record, cleanup', () => {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  const slots = require('../lib/slot');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vscu-slot-'));
+  try {
+    const g = 60;
+    const k = 1000;
+    const at = (j, host = 'H') => path.join(dir, slots.slotName(host, g, j));
+    const opts = (now, extra = {}) => ({ now, gapSeconds: g, host: 'H', window: 'w', pid: 1, ...extra });
+    assert.deepStrictEqual(slots.take(dir, opts(k * g * 1000, { gapSeconds: 0 })), { ok: true, slot: null });
+    const first = slots.take(dir, opts(k * g * 1000 + 5000));
+    assert.strictEqual(first.ok, true);
+    assert.strictEqual(first.slot, slots.slotName('H', g, k));
+    assert.ok(fs.existsSync(path.join(at(k), 'owner.json')));
+    assert.strictEqual(slots.take(dir, opts(k * g * 1000 + 50000)).ok, false);          // same slot
+    const adj = slots.take(dir, opts((k + 1) * g * 1000 + 1000));                     // next slot: previous is taken
+    assert.strictEqual(adj.ok, false);
+    assert.strictEqual(adj.reason, slots.DENIED);
+    assert.strictEqual(slots.take(dir, opts((k + 2) * g * 1000 + 1000)).ok, true);     // two slots on
+    assert.ok(fs.existsSync(at(k)));                                                   // two gaps old: kept
+    // boundary race: another window already created the next slot; this one creates its own, sees it, backs off
+    fs.mkdirSync(at(k + 11));
+    const raced = slots.take(dir, opts((k + 10) * g * 1000 + 59000));
+    assert.strictEqual(raced.ok, false);
+    assert.strictEqual(fs.existsSync(at(k + 10)), false);
+    assert.strictEqual(fs.existsSync(at(k)), false);                                   // more than three gaps old: removed
+    // another machine's slot does not count
+    fs.mkdirSync(at(k + 20, 'OTHER'));
+    assert.strictEqual(slots.take(dir, opts((k + 20) * g * 1000 + 1000)).ok, true);
+    // manual: recorded when free, never refused
+    const manualNear = slots.take(dir, opts((k + 21) * g * 1000 + 1000, { force: true }));
+    assert.strictEqual(manualNear.ok, true);
+    assert.strictEqual(manualNear.slot, slots.slotName('H', g, k + 21));
+    assert.deepStrictEqual(slots.take(dir, opts((k + 21) * g * 1000 + 2000, { force: true })), { ok: true, slot: null });
+    assert.strictEqual(slots.take(dir, opts((k + 30) * g * 1000 + 1000)).ok, true);
+    assert.ok(fs.existsSync(at(k + 20, 'OTHER')));                                     // cleanup never touches another machine's
+    // release frees the slot early
+    assert.strictEqual(slots.release(dir, slots.slotName('H', g, k + 30)), true);
+    assert.strictEqual(slots.take(dir, opts((k + 30) * g * 1000 + 2000)).ok, true);
+    assert.strictEqual(slots.release(dir, '../outside'), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

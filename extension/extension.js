@@ -10,12 +10,14 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const core = require('./lib/core');
+const slots = require('./lib/slot');
 const { listSessions } = require('./lib/procs');
 
 const HOME = process.env.VSCODE_UPDATER_HOME || path.join(os.homedir(), '.vscode-updater');
 const CONFIG_FILE = path.join(HOME, 'config.json');
 const LOG_DIR = path.join(HOME, 'logs');
 const MAX_BACKOFF_MS = 5 * 60000;
+const SLOT_EARLY_RELEASE_MS = 10000;   // after an own reload, free the reload slot this long after activating (null: never)
 
 let ctx;
 let statusItem;
@@ -25,7 +27,7 @@ let polling = false;
 let disposed = false;
 let activatedAt = Date.now();
 const user = { focused: true, active: true, unfocusedSince: null, inactiveSince: null };
-const episode = { key: null, readyAt: null, lastLogged: null, wouldReloadLogged: false, failedNotified: false, backoff: 0 };
+const episode = { key: null, readyAt: null, lastLogged: null, wouldReloadLogged: false, failedNotified: false, backoff: 0, slotWaitLogged: false };
 
 function windowLabel() {
   const f = vscode.workspace.workspaceFolders;
@@ -143,15 +145,65 @@ function sessionRestorable(reg) {
   }
 }
 
+/** This window's Claude Code sessions plus the machine's commit charge, from one process query. */
 async function windowSessions() {
   const entries = registryEntries();
   const candidates = [...new Set(entries.filter((e) => e.entrypoint === 'claude-vscode').map((e) => Number(e.pid)))];
-  const sessions = await listSessions(process.pid, candidates);
+  const { sessions, commit } = await listSessions(process.pid, candidates);
   for (const s of sessions) {
     s.registry = core.pickRegistry(entries, s.pid, s.startTicks);
     s.restorable = sessionRestorable(s.registry);
   }
-  return sessions;
+  return { sessions, commit };
+}
+
+// This window's recent activations and own reload requests, kept in its workspace storage (global storage
+// for a window with no folder, shared by every such window of the instance) with synchronous writes, so the
+// record survives the reload that may follow within seconds. Used to spot an external reload loop.
+function activityFile() {
+  return path.join((ctx.storageUri || ctx.globalStorageUri).fsPath, 'vscode-updater-activity.json');
+}
+
+function readActivity() {
+  const j = readJson(activityFile());
+  return j && typeof j === 'object' ? j : {};
+}
+
+function writeActivity(a) {
+  try {
+    const f = activityFile();
+    fs.mkdirSync(path.dirname(f), { recursive: true });
+    fs.writeFileSync(f, JSON.stringify(a));
+  } catch (e) {
+    output.appendLine(`activity write failed: ${e.message}`);
+  }
+}
+
+/** Called right before this extension reloads the window (automatic or manual). */
+function recordOwnReload(slot) {
+  const a = readActivity();
+  a.ownReloads = core.pushRecent(a.ownReloads, Date.now());
+  a.slot = slot || null;
+  writeActivity(a);
+}
+
+function noteActivation() {
+  const a = readActivity();
+  a.activations = core.pushRecent(a.activations, activatedAt);
+  const external = core.externalActivations(a.activations, a.ownReloads, activatedAt);
+  const warn = core.loopWarning(external, a.lastWarnedAt, activatedAt);
+  if (warn) a.lastWarnedAt = activatedAt;
+  const ownSlot = a.slot && core.ownReloadJustNow(a.ownReloads, activatedAt) ? a.slot : null;
+  a.slot = null;
+  writeActivity(a);
+  if (external.length >= core.LOOP_COUNT) {
+    log('externalReloadLoop', { count: external.length, times: external.map((t) => new Date(t).toISOString()) });
+    if (warn) vscode.window.showWarningMessage(`VS Code Updater: this window was reloaded or restarted ${external.length} times in 2 minutes without VS Code Updater requesting it. Another extension or tool may be reloading it; each reload can leave other extensions' processes running.`);
+  }
+  // Back from an own reload: free the machine-wide slot once this window has settled, so the next window need not wait out the whole gap.
+  if (ownSlot && SLOT_EARLY_RELEASE_MS != null) {
+    setTimeout(() => { if (!disposed && slots.release(HOME, ownSlot)) log('slotReleased', { slot: ownSlot }); }, SLOT_EARLY_RELEASE_MS);
+  }
 }
 
 /** Option B: give a conversation another session started Claude Code's own rename file, so its tab survives the reload. */
@@ -195,9 +247,10 @@ function showStatus(stale, reasons = []) {
   statusItem.show();
 }
 
-function liveFacts(stale, cfg, sessions, failed) {
+/** q: the result of windowSessions() ({ sessions, commit }), or null when it has not been run. */
+function liveFacts(stale, cfg, q, failed) {
   return {
-    stale, cfg, sessions, failed, now: Date.now(), user: { ...user },
+    stale, cfg, sessions: q ? q.sessions : null, commit: q ? q.commit : null, platform: process.platform, failed, now: Date.now(), user: { ...user },
     debugActive: !!vscode.debug.activeDebugSession,
     tasksRunning: vscode.tasks.taskExecutions.length > 0,
   };
@@ -213,12 +266,12 @@ async function poll() {
     showStatus(stale);
     if (!stale.length) {
       if (episode.key) log('updated', { note: 'no longer stale' });
-      Object.assign(episode, { key: null, readyAt: null, lastLogged: null, wouldReloadLogged: false, failedNotified: false, backoff: 0 });
+      Object.assign(episode, { key: null, readyAt: null, lastLogged: null, wouldReloadLogged: false, failedNotified: false, backoff: 0, slotWaitLogged: false });
       return;
     }
     const key = core.targetKey(stale);
     if (episode.key !== key) {
-      Object.assign(episode, { key, readyAt: null, lastLogged: null, wouldReloadLogged: false, failedNotified: false, backoff: 0 });
+      Object.assign(episode, { key, readyAt: null, lastLogged: null, wouldReloadLogged: false, failedNotified: false, backoff: 0, slotWaitLogged: false });
       log('stale', { stale, autoReload: cfg.autoReload });
     }
     const failed = core.reloadFailed(ctx.globalState.get(`attempt:${folderKey()}`), key, activatedAt);
@@ -241,7 +294,7 @@ async function poll() {
     const summary = `${d.action}:${d.reasons.join('|')}`;
     if (summary !== episode.lastLogged) {
       episode.lastLogged = summary;
-      log('gate', { action: d.action, reasons: d.reasons, sessions: facts.sessions ? facts.sessions.map((s) => ({ pid: s.pid, status: s.registry && s.registry.status, restorable: s.restorable, kids: s.kids.map((k) => k.name) })) : undefined });
+      log('gate', { action: d.action, reasons: d.reasons, commitPercent: facts.commit == null ? undefined : Math.round(facts.commit * 1000) / 10, sessions: facts.sessions ? facts.sessions.map((s) => ({ pid: s.pid, status: s.registry && s.registry.status, restorable: s.restorable, kids: s.kids.map((k) => k.name) })) : undefined });
     }
     if (d.sessionsBusy) {
       episode.backoff = Math.min(episode.backoff + 1, 6);
@@ -249,7 +302,7 @@ async function poll() {
     } else {
       episode.backoff = 0;
     }
-    if (d.action !== 'reload' && d.action !== 'title') { episode.readyAt = null; return; }
+    if (d.action !== 'reload' && d.action !== 'title') { episode.readyAt = null; episode.slotWaitLogged = false; return; }
     if (episode.readyAt == null) {
       episode.readyAt = Date.now() + Math.random() * cfg.maxJitterSeconds * 1000;
       delay = Math.min(delay, Math.max(1000, episode.readyAt - Date.now()));
@@ -272,7 +325,7 @@ async function poll() {
       }
     }
     // The session query can take seconds; the user may have come back meanwhile.
-    const last = core.decide(liveFacts(stale, cfg, facts.sessions, failed));
+    const last = core.decide(liveFacts(stale, cfg, { sessions: facts.sessions, commit: facts.commit }, failed));
     if (last.action !== 'reload') {
       log('gate', { action: last.action, reasons: last.reasons, note: 'changed just before reload' });
       episode.readyAt = null;
@@ -283,8 +336,18 @@ async function poll() {
       delay = Math.max(delay, MAX_BACKOFF_MS);   // nothing more to learn each minute; keep the process queries rare
       return;
     }
+    // One automatic reload at a time machine-wide. A refused window keeps its jitter (the gap spaces the retries)
+    // but retries up to half a gap later than its poll, so two windows that backed off together do not meet again.
+    const slot = slots.take(HOME, { now: Date.now(), gapSeconds: cfg.minReloadGapSeconds, host: os.hostname(), window: windowLabel(), pid: process.pid });
+    if (!slot.ok) {
+      delay += Math.random() * cfg.minReloadGapSeconds * 500;
+      showStatus(stale, [slot.reason]);
+      if (!episode.slotWaitLogged) { episode.slotWaitLogged = true; log('gate', { action: 'wait', reasons: [slot.reason], near: slot.near }); }
+      return;
+    }
+    recordOwnReload(slot.slot);
     await ctx.globalState.update(`attempt:${folderKey()}`, { target: key, t: Date.now() });
-    log('reload', { reasons: last.reasons, stale });
+    log('reload', { reasons: last.reasons, stale, slot: slot.slot });
     await vscode.commands.executeCommand('workbench.action.reloadWindow');
   } catch (e) {
     log('error', { message: String(e && e.stack || e) });
@@ -296,22 +359,33 @@ async function poll() {
 }
 
 async function reloadNow() {
+  const cfg = readConfig();
   let sessions = [];
   let busy = [];
+  let memory = null;
   try {
-    const cfg = readConfig();
-    sessions = await windowSessions();
+    const q = await windowSessions();
+    sessions = q.sessions;
     busy = sessions.map((s) => ({ pid: s.pid, ...core.sessionBusy(s, Date.now(), { ...cfg, sessionIdleSeconds: 0 }) })).filter((b) => b.busy);
+    const c = core.commitHold(q.commit, process.platform, cfg);
+    if (c.hold) memory = c.percent != null ? `Commit charge is at ${c.percent}% of the limit; a reload can leave other extensions' processes running.` : 'Commit charge could not be measured.';
   } catch (e) {
     busy = [{ reason: `could not check Claude Code sessions (${String(e.message).split('\n')[0]})` }];
   }
   const working = busy.filter((b) => !b.emptyTab).map((b) => b.reason);
-  if (working.length) {
-    const pick = await vscode.window.showWarningMessage(`Claude Code work is running in this window:\n${working.join('\n')}\nReloading stops it.`, { modal: true }, 'Reload anyway');
+  if (working.length || memory) {
+    const parts = [];
+    if (working.length) parts.push(`Claude Code work is running in this window:\n${working.join('\n')}\nReloading stops it.`);
+    if (memory) parts.push(memory);
+    const pick = await vscode.window.showWarningMessage(parts.join('\n\n'), { modal: true }, 'Reload anyway');
     if (pick !== 'Reload anyway') return;
   }
   titleEmptyTabs(sessions, busy.filter((b) => b.emptyTab).map((b) => b.pid));
-  log('reload', { reasons: ['manual'], busy: busy.map((b) => b.reason) });
+  // A manual reload is never refused by the gap, but it is recorded, so automatic reloads keep their distance from it.
+  let slot = { slot: null };
+  try { slot = slots.take(HOME, { now: Date.now(), gapSeconds: cfg.minReloadGapSeconds, host: os.hostname(), window: windowLabel(), pid: process.pid, force: true }); } catch (e) { output.appendLine(`slot record failed: ${e.message}`); }
+  recordOwnReload(slot.slot);
+  log('reload', { reasons: ['manual'], busy: busy.map((b) => b.reason), slot: slot.slot });
   await vscode.commands.executeCommand('workbench.action.reloadWindow');
 }
 
@@ -319,7 +393,7 @@ async function showState() {
   const cfg = readConfig();
   let sessions;
   try { sessions = await windowSessions(); } catch (e) { sessions = `query failed: ${e.message}`; }
-  output.appendLine(JSON.stringify({ home: HOME, config: cfg, user, activatedAt, stale: computeStale(cfg), sessions, episode }, null, 2));
+  output.appendLine(JSON.stringify({ home: HOME, config: cfg, user, activatedAt, stale: computeStale(cfg), sessions, episode, activity: readActivity() }, null, 2));
   output.show(true);
 }
 
@@ -356,6 +430,7 @@ function activate(context) {
   );
   const cfg = readConfig();
   log('activate', { version: context.extension.packageJSON.version, autoReload: cfg.autoReload, watch: cfg.watch.map((id) => ({ id, version: (vscode.extensions.getExtension(id) || { packageJSON: {} }).packageJSON.version })) });
+  try { noteActivation(); } catch (e) { log('error', { message: `activation record failed: ${e.message}` }); }
   timer = setTimeout(poll, 5000);
 }
 

@@ -10,9 +10,11 @@ const DEFAULTS = Object.freeze({
   pollSeconds: 60,
   sessionIdleSeconds: 60,               // a session must have been idle this long
   maxJitterSeconds: 120,                // random delay so many windows do not reload at once
+  minReloadGapSeconds: 30,              // automatic reloads machine-wide are at least this far apart (0 turns the gap off)
+  holdAtCommitPercent: 90,              // Windows: no automatic reload while commit charge is at or above this share of the limit
 });
 
-const BOUNDS = { idleMinutes: [0, 1440], pollSeconds: [5, 3600], sessionIdleSeconds: [0, 3600], maxJitterSeconds: [0, 3600] };
+const BOUNDS = { idleMinutes: [0, 1440], pollSeconds: [5, 3600], sessionIdleSeconds: [0, 3600], maxJitterSeconds: [0, 3600], minReloadGapSeconds: [0, 3600], holdAtCommitPercent: [50, 100] };
 
 function mergeConfig(raw) {
   const cfg = { ...DEFAULTS };
@@ -215,7 +217,7 @@ function reloadFailed(lastAttempt, key, activatedAt, windowMs = 5 * 60000) {
  * (the caller skips the process query then).
  * Returns { action: 'none' | 'wait' | 'reload', reasons: [] }.
  */
-function decide({ stale, user, debugActive, tasksRunning, sessions, failed, now, cfg }) {
+function decide({ stale, user, debugActive, tasksRunning, sessions, commit, platform, failed, now, cfg }) {
   if (!stale.length) return { action: 'none', reasons: [] };
   if (failed) return { action: 'wait', reasons: ['a reload did not clear this update; reload by hand'] };
   const reasons = [];
@@ -225,6 +227,9 @@ function decide({ stale, user, debugActive, tasksRunning, sessions, failed, now,
   if (tasksRunning) reasons.push('task running');
   if (reasons.length) return { action: 'wait', reasons };
   if (!sessions) return { action: 'wait', reasons: ['sessions not checked'] };
+  // The commit charge arrives with the session query, so it is at most one poll old.
+  const c = commitHold(commit, platform, cfg);
+  if (c.hold) return { action: 'wait', reasons: [c.reason], commitPercent: c.percent };
   const titlePids = [];
   let working = false;
   for (const s of sessions) {
@@ -237,6 +242,53 @@ function decide({ stale, user, debugActive, tasksRunning, sessions, failed, now,
   // Only tabs that would reopen empty stand in the way: title them, then reload (option B).
   if (titlePids.length) return { action: 'title', reasons, pids: titlePids };
   return { action: 'reload', reasons: [u.reason] };
+}
+
+/**
+ * Commit charge gate (Windows). commit: CommittedBytes / CommitLimit from the session query, or null.
+ * On Windows a missing value holds (the query that carries it failed or was malformed); elsewhere there is no comparable signal.
+ */
+function commitHold(commit, platform, cfg) {
+  if (platform !== 'win32') return { hold: false };
+  if (typeof commit !== 'number' || !Number.isFinite(commit)) return { hold: true, reason: 'commit charge not measured' };
+  const percent = Math.round(commit * 1000) / 10;
+  if (percent >= cfg.holdAtCommitPercent) return { hold: true, reason: 'commit charge at or above holdAtCommitPercent', percent };
+  return { hold: false, percent };
+}
+
+// External reload loop: activations of this window that its own reload request did not cause.
+const LOOP_WINDOW_MS = 120000;
+const LOOP_COUNT = 3;
+const OWN_RELOAD_MS = 5 * 60000;          // a minimized window took up to 132 s from the reload request to activation (2026-10-28)
+const LOOP_WARN_EVERY_MS = 600000;
+const RECENT_KEEP = 10;
+
+function pushRecent(list, t) {
+  return [...(Array.isArray(list) ? list.filter((x) => Number.isFinite(x)) : []), t].slice(-RECENT_KEEP);
+}
+
+/**
+ * activations, ownReloads: ms timestamps. Each own reload request excuses the first activation within 5 minutes
+ * after it (the one it caused); returns the activations of the last 2 minutes that no own reload excuses.
+ */
+function externalActivations(activations, ownReloads, now) {
+  const nums = (l) => (Array.isArray(l) ? l.filter((x) => Number.isFinite(x)) : []).sort((a, b) => a - b);
+  const acts = nums(activations);
+  const excused = new Set();
+  for (const r of nums(ownReloads)) {
+    const i = acts.findIndex((a, j) => !excused.has(j) && a >= r && a - r <= OWN_RELOAD_MS);
+    if (i >= 0) excused.add(i);
+  }
+  return acts.filter((a, j) => !excused.has(j) && a <= now && now - a < LOOP_WINDOW_MS);
+}
+
+function loopWarning(external, lastWarnedAt, now) {
+  return external.length >= LOOP_COUNT && !(Number.isFinite(lastWarnedAt) && now - lastWarnedAt < LOOP_WARN_EVERY_MS);
+}
+
+/** Did this extension request a reload of this window within the last 5 minutes (so this activation is its own)? */
+function ownReloadJustNow(ownReloads, now) {
+  return (Array.isArray(ownReloads) ? ownReloads : []).some((r) => r <= now && now - r <= OWN_RELOAD_MS);
 }
 
 /** Parse `ps -A -ww -o pid=,ppid=,command=` output (macOS/Linux) into [{ pid, ppid, commandLine }]. */
@@ -272,4 +324,4 @@ function sessionsFromTable(table, hostPid, candidates = []) {
   }));
 }
 
-module.exports = { DEFAULTS, TRANSCRIPT_WINDOW, mergeConfig, installedVersions, staleList, isToolShell, pickRegistry, firstPrompt, listedInSessionList, dispatchTitle, sessionBusy, userIdle, targetKey, reloadFailed, decide, parsePs, sessionsFromTable };
+module.exports = { DEFAULTS, TRANSCRIPT_WINDOW, mergeConfig, installedVersions, staleList, isToolShell, pickRegistry, firstPrompt, listedInSessionList, dispatchTitle, sessionBusy, userIdle, targetKey, reloadFailed, commitHold, pushRecent, externalActivations, loopWarning, ownReloadJustNow, LOOP_COUNT, decide, parsePs, sessionsFromTable };

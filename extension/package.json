@@ -2,7 +2,7 @@
   "name": "vs-code-updater",
   "displayName": "VS Code Updater (safe reload for Claude Code)",
   "description": "Reloads a window after Claude Code updates, only when no Claude Code work is running in it and you are away from it. Unofficial; not affiliated with Anthropic.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "kisookim",
   "license": "MIT",
   "repository": {

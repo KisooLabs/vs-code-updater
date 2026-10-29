@@ -20,9 +20,12 @@ Every window runs its own copy and decides only for itself, once a minute.
 2. **Are you away?** The window has been unfocused for 10 minutes (`idleMinutes`). A focused window is never reloaded by default.
 3. **Is Claude Code working here?** There is no debug session and no running task, and every Claude Code session of this window is idle. A session is a `claude` process whose parent (or grandparent, behind a process wrapper) is this window's extension host. It counts as idle when its registry file `~/.claude/sessions/<pid>.json` (the one whose `procStart` matches the process start time) says `idle`, has said so for 60 seconds (`sessionIdleSeconds`), and no Claude Code tool shell runs under it (a child process whose command line contains `shell-snapshots` or `CLAUDE_CODE_SHELL_LAUNCHER_SCRIPT`). The tool-shell check exists because a background Bash command or a Monitor leaves the registry at `idle` while its shell runs. A session with no matching registry file counts as working.
 4. **Would every tab come back?** A restored Claude Code tab resumes its conversation only if the conversation is in Claude Code's session list. A conversation that another session started (through `SendMessage`) and that has no typed prompt and no title is left out of that list, so its tab would reopen empty. The extension reads the first and last 64 KB of each session's transcript and applies the list's rule, copied from Claude Code 2.1.310 and unchanged through 2.1.312. When such tabs are the only thing in the way, it writes Claude Code's own rename file for each of those conversations (`<projects>/<folder>/<sessionId>/custom-title.json`) with the title `[dispatch from <name>] <first line of the request>`, and then reloads. An existing title is never overwritten.
-5. After a random delay of up to 2 minutes (`maxJitterSeconds`), so that many windows do not reload at the same moment, the checks run again, once more right before acting, and then the window runs `workbench.action.reloadWindow`.
+5. **Is the machine short of memory?** (Windows only.) No automatic reload while the commit charge is at or above 90% of the commit limit (`holdAtCommitPercent`). The two counters come with the process query of step 3; if they cannot be read, the window waits. On macOS and Linux this check is skipped.
+6. After a random delay of up to 2 minutes (`maxJitterSeconds`), the checks run again, once more right before acting. Then the window takes a machine-wide reload slot, a folder in `~/.vscode-updater`, so that only one automatic reload is in progress at a time across all windows of all VS Code instances on the machine. A window that comes back from such a reload frees its slot 10 seconds after it starts; if it does not come back, the next reload waits between 30 and 60 seconds (one to two `minReloadGapSeconds`). Minimized windows reload slowly: in a test, 76 to 132 seconds passed between the reload and the extension starting again. Then the window runs `workbench.action.reloadWindow`.
 
 While a session is working, the check interval doubles each time, up to 5 minutes. If a window comes back within 5 minutes still stale for the same update, it never reloads itself again for that update; it logs `reloadDidNotHelp` and shows a notification.
+
+Each window also notices when something else keeps reloading it: after 3 or more reloads or restarts within 2 minutes that it did not request, it logs `externalReloadLoop` and shows a warning (at most once per 10 minutes per window). It does not change its own behavior; the warning is there so a loop caused by another extension or tool gets noticed.
 
 ## What a reload costs
 
@@ -32,14 +35,17 @@ Measured on Windows with Claude Code 2.1.309 to 2.1.312:
 - Claude Code tabs come back with their conversations, under the same `sessionId`. A tab in the background is restored when you click it.
 - Processes in the integrated terminal keep running.
 - Scheduled work inside a session (`/loop`, `CronCreate`) lives only in that session's memory and ends with the reload. Nothing on disk shows it, so the extension cannot see it.
+- **On Windows, other extensions' child processes can outlive the reload.** Windows does not end a process's children when the parent ends, so a server another extension started is left running if that extension does not stop it before its extension host goes away. Measured with the R extension (`reditorsupport.r` 3.2.2): its language server, started through the `R.exe` launcher, was left behind on every reload or close of a window with an R file open, 16 processes and 875 MB each time, and on one machine 180 such trees (93 GB) had built up. Setting `"r.rpath.windows"` to the `bin/x64/Rterm.exe` of your R installation (not `bin/R.exe`) makes the R servers end with the window. This cost is why reloads are spaced and held under memory pressure (steps 5 and 6). To look for leftovers, compare the number of `Rterm.exe` (or other language-server) processes with the number of open windows that use them.
 
 ## What it reads and writes
 
-It reads `extensions.json`, the session registry, the process table (PowerShell `Get-CimInstance Win32_Process` on Windows, `ps` elsewhere) and the first and last 64 KB of the transcripts of this window's sessions. The process query runs only while the window is stale and you are away. Nothing is sent over the network.
+It reads `extensions.json`, the session registry, the process table (PowerShell `Get-CimInstance Win32_Process` on Windows, `ps` elsewhere), on Windows the commit charge (`Win32_OperatingSystem`, in the same query) and the first and last 64 KB of the transcripts of this window's sessions. The process query runs only while the window is stale and you are away. Nothing is sent over the network.
 
 It writes:
 
-- `~/.vscode-updater/logs/YYYY-MM-DD.jsonl`, one line per event (`activate`, `stale`, `gate`, `wouldReload`, `titled`, `reload`, `reloadDidNotHelp`, `updated`, `error`), each with the machine name, the window's folder name and the extension host's pid. A `titled` line contains the title, which is the first line of a request. Logs are never rotated or deleted; a day with one update and 23 open windows wrote 84 KB.
+- `~/.vscode-updater/logs/YYYY-MM-DD.jsonl`, one line per event (`activate`, `stale`, `gate`, `wouldReload`, `titled`, `reload`, `slotReleased`, `externalReloadLoop`, `reloadDidNotHelp`, `updated`, `error`), each with the machine name, the window's folder name and the extension host's pid. A `titled` line contains the title, which is the first line of a request. Logs are never rotated or deleted; a day with one update and 23 open windows wrote 84 KB.
+- `~/.vscode-updater/reload-slot-<machine>-<gap>-<n>/`, one small folder per automatic reload, removed by later reloads once it is older than three gaps.
+- `vscode-updater-activity.json` in each window's workspace storage (VS Code's own per-workspace folder; windows with no folder share one in the global storage): the window's last 10 activation and reload-request times.
 - `custom-title.json` in Claude Code's project folder, only for the conversations described in step 4. Such a conversation then appears, titled, in Claude Code's history list, where it was missing before.
 
 ## Install
@@ -61,14 +67,18 @@ It writes:
   "reloadWhenFocusedInactive": false,
   "pollSeconds": 60,
   "sessionIdleSeconds": 60,
-  "maxJitterSeconds": 120
+  "maxJitterSeconds": 120,
+  "minReloadGapSeconds": 30,
+  "holdAtCommitPercent": 90
 }
 ```
 
 - `autoReload`: `false` logs `wouldReload` instead of reloading.
 - `watch`: extension ids whose update makes a window stale.
 - `reloadWhenFocusedInactive`: also reload a focused window after `idleMinutes` without input. Off because it is untested whether typing in the Claude Code panel counts as input for VS Code.
-- Numbers are clamped: `pollSeconds` 5 to 3600, `idleMinutes` 0 to 1440, the others 0 to 3600.
+- `minReloadGapSeconds`: the minimum spacing of automatic reloads on the machine; `0` turns the spacing off. A manual reload from the status bar is never refused but is recorded, so automatic reloads keep their distance from it.
+- `holdAtCommitPercent` (Windows): no automatic reload at or above this share of the commit limit; `100` never holds. A manual reload at that level asks first.
+- Numbers are clamped: `pollSeconds` 5 to 3600, `idleMinutes` 0 to 1440, `holdAtCommitPercent` 50 to 100, the others 0 to 3600.
 
 The configuration is a file in your home directory, not a VS Code setting, because windows with different `--user-data-dir` values have separate settings but share one home directory. `VSCODE_UPDATER_HOME` moves the config and the logs. `CLAUDE_CONFIG_DIR` is honored when looking for registry files and transcripts.
 
